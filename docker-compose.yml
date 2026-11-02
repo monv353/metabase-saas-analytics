@@ -1,0 +1,80 @@
+# Metabase + a Postgres "warehouse" + a separate Postgres for Metabase's own application DB.
+# Sized for a shared 7.6 GB host: total hard limit is ~3 GB across all three containers.
+name: pf-metabase
+
+services:
+  # The data Metabase analyses. Seeded on first start from ./warehouse/*.{sql,sh}.
+  # Not published to the host: only Metabase (same Docker network) can reach it.
+  warehouse:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: saas
+      POSTGRES_USER: warehouse_admin
+      POSTGRES_PASSWORD: ${WAREHOUSE_ADMIN_PASSWORD:?set in .env}
+      # Read by warehouse/00-roles.sh to create the read-only role Metabase uses.
+      READER_PASSWORD: ${WAREHOUSE_READER_PASSWORD:?set in .env}
+    volumes:
+      - warehouse-data:/var/lib/postgresql/data
+      - ./warehouse:/docker-entrypoint-initdb.d:ro
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "work_mem=16MB"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouse_admin -d saas"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s   # first boot runs the seed scripts
+    mem_limit: 512m
+
+  # Metabase's application database: users, questions, dashboards, permissions, sync metadata.
+  # Postgres instead of the embedded H2 file (see README: "Why a separate app DB").
+  appdb:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: metabase
+      POSTGRES_USER: metabase
+      POSTGRES_PASSWORD: ${MB_DB_PASS:?set in .env}
+    volumes:
+      - appdb-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metabase -d metabase"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+
+  metabase:
+    image: metabase/metabase:${MB_VERSION:-v0.65.2.5}
+    restart: unless-stopped
+    depends_on:
+      appdb:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: appdb
+      MB_DB_PORT: "5432"
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase
+      MB_DB_PASS: ${MB_DB_PASS}
+      MB_SITE_NAME: Acme Cloud Analytics
+      MB_ANON_TRACKING_ENABLED: "false"
+      MB_CHECK_FOR_UPDATES: "false"
+      # Heap capped at 1.5 GB; container limit leaves ~700 MB for metaspace, threads and off-heap.
+      JAVA_OPTS: -Xms512m -Xmx1536m -XX:+UseG1GC
+      JAVA_TIMEZONE: UTC
+    ports:
+      - "127.0.0.1:3300:3000"   # loopback only; reach it through `ssh -L`
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health | grep -q ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    mem_limit: 2304m
+
+volumes:
+  warehouse-data:
+  appdb-data:
